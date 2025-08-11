@@ -1,23 +1,20 @@
 package frc.robot.subsystems;
 
 import org.littletonrobotics.junction.Logger;
-
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
 import frc.lib.structure.mechanisms.RotatingMechanism;
 import frc.lib.structure.mechanisms.SetPoint;
 import frc.lib.structure.motors.KrakenSimIO;
 import frc.lib.structure.motors.MotorConfig;
 import frc.lib.structure.motors.MotorInputs;
-import frc.lib.structure.motors.MotorRequest;
 import frc.lib.structure.physics.physicalProperties;
 
 public class RotatingMechanismTestSubsystem extends SubsystemBase {
     private final KrakenSimIO motorIO;
-    private final RotatingMechanism rotatingMechanism;
+    private final RotatingMechanism<?, ?, ?> rotatingMechanism;
     private final MotorConfig config;
-    private final MotorRequest motorRequest;
 
-    // Physical properties for the rotating mechanism (e.g., an arm)
+    // Physical properties for the rotating mechanism (e.g., an arm) (Z is up)
     private static final double ARM_LENGTH = 0.5; // meters
     private static final double ARM_MASS = 2.0; // kg
     private static final double MOMENT_OF_INERTIA = ARM_MASS * ARM_LENGTH * ARM_LENGTH / 3.0; // kg⋅m²
@@ -33,6 +30,9 @@ public class RotatingMechanismTestSubsystem extends SubsystemBase {
         config.maxVel = 10.0; // rad/s
         config.maxAcc = 20.0; // rad/s²
         config.gearRatio = 10.0;
+        // Scale from torque feedforward (N*m at output) to motor current (A) in sim:
+        // desiredCurrent = feedforward * kT; with MOTOR_KT=0.1 and gearRatio=10 => kT ~ 1.0
+        config.kT = 0;
         config.reversed = false;
         config.isBreak = true;
         config.supplyCurrentLimitEnabled = true;
@@ -44,27 +44,28 @@ public class RotatingMechanismTestSubsystem extends SubsystemBase {
 
         // Create motor IO and inputs/outputs
         motorIO = new KrakenSimIO(config);
-        motorRequest = new MotorRequest();
 
         // Create physical properties for the rotating mechanism
         // Create SimpleMatrix for CG and MOI
         org.ejml.simple.SimpleMatrix cgMatrix = new org.ejml.simple.SimpleMatrix(3, 1);
-        cgMatrix.set(0, 0, ARM_LENGTH / 2.0); // CG at middle of arm
+        cgMatrix.set(0, 0, ARM_LENGTH / 2.0); // CG at middle of arm along X
         cgMatrix.set(1, 0, 0.0);
         cgMatrix.set(2, 0, 0.0);
 
         org.ejml.simple.SimpleMatrix moiMatrix = new org.ejml.simple.SimpleMatrix(3, 3);
-        moiMatrix.set(0, 0, MOMENT_OF_INERTIA); // Only about Z-axis
-        moiMatrix.set(1, 1, 0.0);
+        // Moment of inertia about Y for a planar XZ arm (rotate about Y-axis)
+        moiMatrix.set(0, 0, 0.0);
+        moiMatrix.set(1, 1, MOMENT_OF_INERTIA); // about Y-axis
         moiMatrix.set(2, 2, 0.0);
 
-        physicalProperties physics = new physicalProperties(ARM_MASS, cgMatrix, moiMatrix, java.util.Optional.empty());
+        physicalProperties physics =
+                new physicalProperties(ARM_MASS, cgMatrix, moiMatrix, java.util.Optional.empty());
 
-        // Create rotation axis and pivot point
+        // Create rotation axis and pivot point (rotate about Y-axis)
         org.ejml.simple.SimpleMatrix rotationAxis = new org.ejml.simple.SimpleMatrix(3, 1);
         rotationAxis.set(0, 0, 0.0);
-        rotationAxis.set(1, 0, 0.0);
-        rotationAxis.set(2, 0, 1.0); // Rotate around Z-axis
+        rotationAxis.set(1, 0, 1.0); // Rotate around Y-axis
+        rotationAxis.set(2, 0, 0.0);
 
         org.ejml.simple.SimpleMatrix pivotPoint = new org.ejml.simple.SimpleMatrix(3, 1);
         pivotPoint.set(0, 0, 0.0);
@@ -88,15 +89,18 @@ public class RotatingMechanismTestSubsystem extends SubsystemBase {
         // Update mechanism state from motor inputs
         rotatingMechanism.updateMechanismState();
 
-        // Execute control if setpoint is active
+        // Delegate control (includes feedforward computation and distribution)
         rotatingMechanism.executeControl();
 
         // Log mechanism state
-        Logger.recordOutput("RotatingMechanismTest/Mechanism/CurrentAngle", rotatingMechanism.getCurrentAngle());
-        Logger.recordOutput("RotatingMechanismTest/Mechanism/AngularVelocity", rotatingMechanism.getAngularVelocity());
+        Logger.recordOutput("RotatingMechanismTest/Mechanism/CurrentAngle",
+                rotatingMechanism.getCurrentAngle());
+        Logger.recordOutput("RotatingMechanismTest/Mechanism/AngularVelocity",
+                rotatingMechanism.getAngularVelocity());
         Logger.recordOutput("RotatingMechanismTest/Mechanism/AngularAcceleration",
                 rotatingMechanism.getAngularAcceleration());
-        Logger.recordOutput("RotatingMechanismTest/Mechanism/AtTarget", rotatingMechanism.isAtTarget());
+        Logger.recordOutput("RotatingMechanismTest/Mechanism/AtTarget",
+                rotatingMechanism.isAtTarget());
 
         // Log motor state from mechanism's motor inputs
         if (rotatingMechanism.getMotorCount() > 0) {
@@ -109,15 +113,20 @@ public class RotatingMechanismTestSubsystem extends SubsystemBase {
         }
     }
 
+
+
     /**
      * Set the target angle for the rotating mechanism
      * 
-     * @param targetAngle        Target angle in radians
-     * @param targetVelocity     Target angular velocity in rad/s
+     * @param targetAngle Target angle in radians
+     * @param targetVelocity Target angular velocity in rad/s
      * @param targetAcceleration Target angular acceleration in rad/s²
      */
-    public void setTargetAngle(double targetAngle, double targetVelocity, double targetAcceleration) {
-        SetPoint setpoint = new SetPoint(targetAngle, targetVelocity, targetAcceleration, 0.0);
+    public void setTargetAngle(double targetAngle, double targetVelocity,
+            double targetAcceleration) {
+        // Feedforward is computed inside RotatingMechanism.executeControl(); mark as unused here
+        SetPoint setpoint =
+                new SetPoint(targetAngle, targetVelocity, targetAcceleration, Double.NaN);
         rotatingMechanism.setTargetSetpoint(setpoint);
 
         Logger.recordOutput("RotatingMechanismTest/Setpoint/Position", targetAngle);

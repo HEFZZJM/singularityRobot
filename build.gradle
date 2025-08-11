@@ -76,6 +76,8 @@ dependencies {
     annotationProcessor "org.littletonrobotics.akit:akit-autolog:$akitJson.version"
     testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // JSON parsing for setpoint group loader
+    implementation 'com.google.code.gson:gson:2.10.1'
 }
 
 test {

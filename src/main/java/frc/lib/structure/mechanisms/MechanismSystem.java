@@ -6,9 +6,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import org.ejml.simple.SimpleMatrix;
+import org.littletonrobotics.junction.Logger;
 import frc.lib.structure.configBase;
 import frc.lib.structure.inputBase;
 import frc.lib.structure.requestBase;
+import frc.lib.structure.motors.MotorRequest;
 
 /**
  * Mechanism system manager Manages physical relationships between multiple mechanisms, builds tree
@@ -174,6 +176,128 @@ public class MechanismSystem {
     }
 
     /**
+     * Follow a SetpointGroup at a given time (seconds): - Selects the appropriate setpoint snapshot
+     * for the given time - Sets each mechanism's setpoint - Computes system-level feedforward
+     * (considering parent-child interactions) - Distributes and sends feedforward to motors with
+     * the position/velocity/acceleration setpoints
+     */
+    public void followSetpointGroupAtTime(SetpointGroup group, double timeSeconds) {
+        if (group == null || group.size() == 0) {
+            return;
+        }
+
+        // Find index at or before timeSeconds
+        int idx = 0;
+        for (int i = 0; i < group.size(); i++) {
+            if (group.getTimeAtIndex(i) <= timeSeconds) {
+                idx = i;
+            } else {
+                break;
+            }
+        }
+
+        Map<String, SetPoint> setpoints = group.getSetpointsAtIndex(idx);
+        Logger.recordOutput("MSFF/" + systemName + "/PlaybackTime", timeSeconds);
+        Logger.recordOutput("MSFF/" + systemName + "/PlaybackIndex", idx);
+        applySetpointsWithSystemFeedforward(setpoints);
+    }
+
+    /**
+     * Applies setpoints and sends system-level feedforward motor requests.
+     */
+    public void applySetpointsWithSystemFeedforward(Map<String, SetPoint> setpoints) {
+        if (setpoints == null || setpoints.isEmpty())
+            return;
+
+        // Set setpoints to mechanisms
+        setMechanismSetpoints(setpoints);
+
+        // Calculate system FF
+        Map<String, SimpleMatrix> ffForces = calculateSystemFeedforward(setpoints);
+
+        // Send to motors per mechanism using each mechanism's distribution logic
+        for (Map.Entry<String, SetPoint> entry : setpoints.entrySet()) {
+            String mechName = entry.getKey();
+            SetPoint sp = entry.getValue();
+            Mechanism<? extends configBase, ? extends inputBase, ? extends requestBase> mech =
+                    mechanisms.get(mechName);
+            if (mech == null)
+                continue;
+
+            SimpleMatrix totalFF = ffForces.getOrDefault(mechName, new SimpleMatrix(3, 1));
+            // Log total FF vector and axis projection
+            String base = "MSFF/" + systemName + "/" + mechName;
+            if (totalFF.getNumRows() >= 3) {
+                Logger.recordOutput(base + "/Vec/X", totalFF.get(0, 0));
+                Logger.recordOutput(base + "/Vec/Y", totalFF.get(1, 0));
+                Logger.recordOutput(base + "/Vec/Z", totalFF.get(2, 0));
+            }
+            if (mech instanceof RotatingMechanism<?, ?, ?> rot) {
+                SimpleMatrix axis = rot.getRotationAxis();
+                SimpleMatrix axisU = normalizeAxis(axis);
+                double axisTorque = dot3(totalFF, axisU);
+                Logger.recordOutput(base + "/AxisTorque", axisTorque);
+            } else if (mech instanceof LinearMechanism<?, ?, ?> lin) {
+                SimpleMatrix axis = lin.getMotionAxis();
+                SimpleMatrix axisU = normalizeAxis(axis);
+                double axisForce = dot3(totalFF, axisU);
+                Logger.recordOutput(base + "/AxisForce", axisForce);
+            }
+            // Use mechanism-specific distribution (gear ratios/efficiency) to split among motors
+            List<Double> motorFFs = mech.distributeFeedforwardAmongMotors(totalFF);
+
+            // Send to each motor
+            for (int i = 0; i < mech.motorIOs.size(); i++) {
+                double ff = (i < motorFFs.size()) ? motorFFs.get(i) : 0.0;
+                MotorRequest req =
+                        new MotorRequest().withPosition(sp.position).withVelocity(sp.velocity)
+                                .withAcceleration(sp.acceleration).withFeedforward(ff);
+                mech.motorIOs.get(i).set(req);
+            }
+        }
+    }
+
+    private static SimpleMatrix normalizeAxis(SimpleMatrix v) {
+        double x = v.get(0, 0), y = v.get(1, 0), z = v.get(2, 0);
+        double n = Math.sqrt(x * x + y * y + z * z);
+        if (n == 0.0)
+            return new SimpleMatrix(3, 1, true, 0.0, 0.0, 1.0);
+        return new SimpleMatrix(3, 1, true, x / n, y / n, z / n);
+    }
+
+    private static double dot3(SimpleMatrix a, SimpleMatrix b) {
+        return a.get(0, 0) * b.get(0, 0) + a.get(1, 0) * b.get(1, 0) + a.get(2, 0) * b.get(2, 0);
+    }
+
+    private static SimpleMatrix cross3(SimpleMatrix a, SimpleMatrix b) {
+        double ax = a.get(0, 0), ay = a.get(1, 0), az = a.get(2, 0);
+        double bx = b.get(0, 0), by = b.get(1, 0), bz = b.get(2, 0);
+        return new SimpleMatrix(3, 1, true, ay * bz - az * by, az * bx - ax * bz,
+                ax * by - ay * bx);
+    }
+
+    private SimpleMatrix getChildWorldCG(MechanismState childState) {
+        if (childState.type == MechanismType.LINEAR) {
+            LinearMechanism<?, ?, ?> lin = (LinearMechanism<?, ?, ?>) childState.mechanism;
+            return lin.getCurrentCenterOfMass();
+        } else {
+            RotatingMechanism<?, ?, ?> rot = (RotatingMechanism<?, ?, ?>) childState.mechanism;
+            SimpleMatrix rLocal = rot.getPhysicalProperties().CG.minus(rot.getPivotPoint());
+            SimpleMatrix axisU = normalizeAxis(rot.getRotationAxis());
+            // Rodrigues rotation to world by current angle
+            double angle = childState.position;
+            double c = Math.cos(angle), s = Math.sin(angle);
+            SimpleMatrix term1 = rLocal.scale(c);
+            SimpleMatrix kxv = cross3(axisU, rLocal);
+            SimpleMatrix term2 = kxv.scale(s);
+            double kdotv = dot3(axisU, rLocal);
+            SimpleMatrix term3 = axisU.scale(kdotv * (1.0 - c));
+            SimpleMatrix rWorld = term1.plus(term2).plus(term3);
+            return rWorld.plus(rot.getPivotPoint());
+        }
+    }
+
+    /**
      * Update all mechanism states based on setpoints
      */
     private void updateAllMechanismStatesFromSetpoints(Map<String, SetPoint> setpoints,
@@ -237,22 +361,47 @@ public class MechanismSystem {
             return;
         }
 
-        // Calculate base feedforward for this mechanism
-        SimpleMatrix baseFeedforward = mechanism.getFeedforward(parentMotion);
+        // Compose base linear acceleration (a_base) in world frame that this mechanism experiences
+        // Start from parent's a_base, then add this mechanism的线性轴向加速度
+        SimpleMatrix nonInertialAccel = parentMotion;
+        if (state.type == MechanismType.LINEAR) {
+            LinearMechanism<?, ?, ?> lin = (LinearMechanism<?, ?, ?>) state.mechanism;
+            SimpleMatrix axisU = normalizeAxis(lin.getMotionAxis());
+            // a_base(child) = a_base(parent) + a_self * axis
+            nonInertialAccel = parentMotion.plus(axisU.scale(state.acceleration));
+        }
 
-        // Add parent motion effects to children
+        // Calculate base feedforward for this mechanism given current non-inertial acceleration
+        SimpleMatrix baseFeedforward = mechanism.getFeedforward(nonInertialAccel);
+
+        // Add parent motion effects to children, including rotational kinematics if parent rotates
         List<String> children = getChildren(mechanismName);
         for (String childName : children) {
             MechanismState childState = mechanismStates.get(childName);
             if (childState != null) {
-                // Calculate how parent motion affects child
-                SimpleMatrix childMotionEffect =
-                        calculateChildMotionEffect(state, childState, parentMotion);
+                SimpleMatrix childAccel = nonInertialAccel;
+                if (state.type == MechanismType.ROTATING) {
+                    RotatingMechanism<?, ?, ?> rot = (RotatingMechanism<?, ?, ?>) state.mechanism;
+                    SimpleMatrix axisU = normalizeAxis(rot.getRotationAxis());
+                    // Parent angular kinematics
+                    double w = state.velocity; // rad/s
+                    double alpha = state.acceleration; // rad/s^2
+                    SimpleMatrix omega = axisU.scale(w);
+                    SimpleMatrix alphav = axisU.scale(alpha);
+                    // Child CG position in world
+                    SimpleMatrix childCG = getChildWorldCG(childState);
+                    SimpleMatrix rc = childCG.minus(rot.getPivotPoint());
+                    // Remove axial component (lever arm perpendicular to axis)
+                    double proj = dot3(axisU, rc);
+                    SimpleMatrix rcPerp = rc.minus(axisU.scale(proj));
+                    // a_add = ω×(ω×r) + α×r
+                    SimpleMatrix aCent = cross3(omega, cross3(omega, rcPerp));
+                    SimpleMatrix aTan = cross3(alphav, rcPerp);
+                    childAccel = childAccel.plus(aCent).plus(aTan);
+                }
 
-                // Recursively calculate child feedforward with combined motion
-                SimpleMatrix combinedMotion = parentMotion.plus(childMotionEffect);
                 calculateTopDownFeedforward(childName, setpoints, feedforwardForces,
-                        mechanismStates, combinedMotion);
+                        mechanismStates, childAccel);
             }
         }
 
@@ -318,22 +467,19 @@ public class MechanismSystem {
         // proper kinematic transformations based on the physical connection
 
         if (parentState.type == MechanismType.LINEAR && childState.type == MechanismType.LINEAR) {
-            // Linear parent affects linear child through direct coupling
-            return parentMotion.scale(0.5); // Simplified coupling factor
+            // Pass through non-inertial acceleration
+            return parentMotion;
         } else if (parentState.type == MechanismType.LINEAR
                 && childState.type == MechanismType.ROTATING) {
-            // Linear parent affects rotating child (e.g., elevator affects arm)
-            // Convert linear motion to angular motion effect
-            return new SimpleMatrix(3, 1, true, parentMotion.get(0, 0) * 0.1, // Simplified coupling
-                    parentMotion.get(1, 0) * 0.1, parentMotion.get(2, 0) * 0.1);
+            // Pass through non-inertial acceleration (child will use it)
+            return parentMotion;
         } else if (parentState.type == MechanismType.ROTATING
                 && childState.type == MechanismType.LINEAR) {
-            // Rotating parent affects linear child
-            return new SimpleMatrix(3, 1, true, parentMotion.get(0, 0) * 0.1,
-                    parentMotion.get(1, 0) * 0.1, parentMotion.get(2, 0) * 0.1);
+            // Rotating parent imparts a_add to linear child; already handled in top-down pass
+            return parentMotion;
         } else {
-            // Rotating parent affects rotating child
-            return parentMotion.scale(0.3); // Simplified coupling factor
+            // Rotating parent affects rotating child: rely on a_add via top-down; no extra here
+            return parentMotion;
         }
     }
 
@@ -351,19 +497,23 @@ public class MechanismSystem {
             return childForce.scale(-1.0); // Reaction force is opposite
         } else if (parentState.type == MechanismType.LINEAR
                 && childState.type == MechanismType.ROTATING) {
-            // Rotating child exerts torque on linear parent
-            // Convert torque to force effect
-            return new SimpleMatrix(3, 1, true, -childForce.get(0, 0) * 0.1,
-                    -childForce.get(1, 0) * 0.1, -childForce.get(2, 0) * 0.1);
+            // Project child's total force along parent's axis as reaction
+            LinearMechanism<?, ?, ?> parentLin = (LinearMechanism<?, ?, ?>) parentState.mechanism;
+            SimpleMatrix parentAxisU = normalizeAxis(parentLin.getMotionAxis());
+            double comp = dot3(childForce, parentAxisU);
+            return parentAxisU.scale(-comp);
         } else if (parentState.type == MechanismType.ROTATING
                 && childState.type == MechanismType.LINEAR) {
-            // Linear child exerts force on rotating parent
-            // Convert force to torque effect
-            return new SimpleMatrix(3, 1, true, -childForce.get(0, 0) * 0.1,
-                    -childForce.get(1, 0) * 0.1, -childForce.get(2, 0) * 0.1);
+            // Linear child exerts force on rotating parent: τ = r × F at parent's pivot
+            RotatingMechanism<?, ?, ?> parentRot =
+                    (RotatingMechanism<?, ?, ?>) parentState.mechanism;
+            SimpleMatrix childCG = getChildWorldCG(childState);
+            SimpleMatrix rc = childCG.minus(parentRot.getPivotPoint());
+            SimpleMatrix torque = cross3(rc, childForce);
+            return torque;
         } else {
-            // Rotating child exerts torque on rotating parent
-            return childForce.scale(-0.5); // Simplified reaction factor
+            // Rotating child exerts torque on rotating parent: combine torques directly
+            return childForce.scale(-1.0);
         }
     }
 
